@@ -78,6 +78,8 @@ pub use pid::{PidStatus, check_pid_file, read_pid, remove_pid, write_pid};
 pub use process_guardian::maybe_run_process_guardian;
 pub use process_scope::{PreparedProcessScope, ProcessScope, StopPolicy, stop_process_scopes};
 pub use pty::PtyProcess;
+#[cfg(target_os = "linux")]
+pub use socket_activation::configure_linux_capabilities;
 pub use socket_activation::{
     ActivatedSockets, ActivationSpec, ActivationSpecBuilder, SD_LISTEN_FDS_START,
     SocketActivationWrapper, activation_from_listen,

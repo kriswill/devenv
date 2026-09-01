@@ -851,6 +851,47 @@ impl Devenv {
             .get_or_try_init(|| processes::get_process_runtime_dir(&self.devenv_runtime))
     }
 
+    fn proxy_owner(&self) -> String {
+        self.devenv_dotfile.to_string_lossy().into_owned()
+    }
+
+    async fn reconcile_proxy_routes(&self, task_configs: &[tasks::TaskConfig]) -> Result<()> {
+        let enabled = self
+            .backend
+            .eval_devenv(&["devenv.config.process.proxy.enable"])
+            .await
+            .wrap_err("failed to evaluate whether the localhost proxy is enabled")?;
+        let enabled: bool = serde_json::from_str(&enabled)
+            .into_diagnostic()
+            .wrap_err("process.proxy.enable is not a boolean")?;
+        if !enabled {
+            // Reconcile a previous enabled configuration without starting the
+            // shared proxy when it is not already running.
+            crate::proxy::clear(&self.proxy_owner());
+            return Ok(());
+        }
+
+        let configured_name = self
+            .backend
+            .eval_devenv(&["devenv.config.name"])
+            .await
+            .wrap_err("failed to evaluate the project name for localhost proxy routes")?;
+        let project_name: Option<String> = serde_json::from_str(&configured_name)
+            .into_diagnostic()
+            .wrap_err("project name is not a string")?;
+        let project_name = project_name
+            .filter(|name| !name.trim().is_empty())
+            .or_else(|| {
+                self.devenv_root
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .ok_or_else(|| miette!("could not derive a project name for localhost proxy routes"))?;
+        let owner = self.proxy_owner();
+        let routes = crate::proxy::project_routes(&project_name, &owner, task_configs)?;
+        crate::proxy::reconcile(&owner, routes).await
+    }
+
     /// Build a `tasks::Config` with common fields filled in.
     ///
     /// The bash path is resolved here rather than passed in: process tasks with
@@ -2490,9 +2531,23 @@ impl Devenv {
             .await?;
         envs.extend(exports);
 
+        // When enabled, named process ports become friendly localhost URLs.
+        // The proxy is shared across projects and starts lazily on the first
+        // `devenv up` that has at least one route.
+        self.reconcile_proxy_routes(&task_configs).await?;
+
         // ── Phase 3: Running processes ──────────────────────────────
-        self.start_processes(processes, task_mode, envs, options, Some(task_configs))
-            .await
+        let owns_foreground_manager = options.mode == ClientRunMode::Follow
+            && !options.daemon
+            && !self.native_manager_running().await
+            && !self.external_process_manager_state_exists();
+        let result = self
+            .start_processes(processes, task_mode, envs, options, Some(task_configs))
+            .await;
+        if owns_foreground_manager || result.is_err() {
+            crate::proxy::clear(&self.proxy_owner());
+        }
+        result
     }
 
     /// Start processes after shell environment and tasks are already configured.
@@ -2993,6 +3048,7 @@ impl Devenv {
     pub async fn down(&self) -> Result<()> {
         if let Some(server) = self.native_api_server.get() {
             server.manager().stop_all().await?;
+            crate::proxy::clear(&self.proxy_owner());
             return Ok(());
         }
 
@@ -3008,10 +3064,13 @@ impl Devenv {
                 // Stopping does not invoke the launcher, so a dummy path is sufficient.
                 Box::new(self.external_process_manager_control())
             } else {
+                crate::proxy::clear(&self.proxy_owner());
                 bail!("No process manager is running. Start processes first with `devenv up -d`")
             };
 
-        manager.stop().await
+        manager.stop().await?;
+        crate::proxy::clear(&self.proxy_owner());
+        Ok(())
     }
 
     pub async fn wait_for_ready(&self, timeout: std::time::Duration) -> Result<()> {

@@ -11,6 +11,53 @@ use crate::config::{ListenKind, ListenSpec};
 
 pub const SD_LISTEN_FDS_START: RawFd = 3;
 
+#[cfg(target_os = "linux")]
+fn parse_linux_capabilities(capabilities: &[String]) -> std::io::Result<Vec<caps::Capability>> {
+    capabilities
+        .iter()
+        .map(|name| {
+            let normalized = if name.to_uppercase().starts_with("CAP_") {
+                name.to_uppercase()
+            } else {
+                format!("CAP_{}", name.to_uppercase())
+            };
+            normalized
+                .parse::<caps::Capability>()
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn raise_linux_capabilities(capabilities: &[caps::Capability]) -> std::io::Result<()> {
+    for capability in capabilities {
+        caps::raise(None, caps::CapSet::Inheritable, *capability)
+            .and_then(|_| caps::raise(None, caps::CapSet::Ambient, *capability))
+            .map_err(|error| {
+                std::io::Error::new(std::io::ErrorKind::PermissionDenied, error.to_string())
+            })?;
+    }
+    Ok(())
+}
+
+/// Arrange for a command to receive devenv's configured ambient Linux
+/// capabilities immediately before it is executed.
+#[cfg(target_os = "linux")]
+pub fn configure_linux_capabilities(
+    command: &mut std::process::Command,
+    capabilities: &[String],
+) -> std::io::Result<()> {
+    use std::os::unix::process::CommandExt;
+
+    let capabilities = parse_linux_capabilities(capabilities)?;
+    // SAFETY: this installs the same pre-exec capability operations used by
+    // ProcessSetupWrapper below.
+    unsafe {
+        command.pre_exec(move || raise_linux_capabilities(&capabilities));
+    }
+    Ok(())
+}
+
 /// Activation entry (internal)
 enum ActivationEntry {
     Tcp {
@@ -278,21 +325,7 @@ impl CommandWrapper for ProcessSetupWrapper {
 
         // Parse capabilities upfront (before fork) so errors are reported early
         #[cfg(target_os = "linux")]
-        let parsed_caps: Vec<caps::Capability> = {
-            self.capabilities
-                .iter()
-                .map(|name| {
-                    // Normalize: add CAP_ prefix if not present
-                    let normalized = if name.to_uppercase().starts_with("CAP_") {
-                        name.to_uppercase()
-                    } else {
-                        format!("CAP_{}", name.to_uppercase())
-                    };
-                    normalized.parse::<caps::Capability>()
-                })
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?
-        };
+        let parsed_caps = parse_linux_capabilities(&self.capabilities)?;
 
         // Capabilities are silently ignored on non-Linux platforms
         #[cfg(not(target_os = "linux"))]
@@ -370,13 +403,7 @@ impl CommandWrapper for ProcessSetupWrapper {
                 // Capabilities are applied as ambient (inheritable first, then ambient)
                 // so they are inherited by child processes.
                 #[cfg(target_os = "linux")]
-                for cap in &parsed_caps {
-                    caps::raise(None, caps::CapSet::Inheritable, *cap)
-                        .and_then(|_| caps::raise(None, caps::CapSet::Ambient, *cap))
-                        .map_err(|e| {
-                            std::io::Error::new(std::io::ErrorKind::PermissionDenied, e.to_string())
-                        })?;
-                }
+                raise_linux_capabilities(&parsed_caps)?;
 
                 Ok(())
             });
@@ -399,6 +426,16 @@ mod tests {
             .build();
 
         assert_eq!(spec.entries.len(), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn capability_setup_rejects_unknown_names_before_spawn() {
+        let mut command = std::process::Command::new("true");
+        let error =
+            configure_linux_capabilities(&mut command, &["definitely_not_a_capability".to_owned()])
+                .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     }
 
     #[test]
