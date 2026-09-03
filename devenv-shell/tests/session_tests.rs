@@ -915,3 +915,65 @@ async fn test_print_watched_files() {
     drop(cmd_tx);
     let _ = handle.await;
 }
+
+/// Regression test for the reply ordering behind the virtual-terminal mux:
+/// a program sends `OSC 11 ; ?` followed by `CSI 6 n` and treats the cursor
+/// report as the end of the colour answer (termenv, hence gh/glow). The OSC
+/// is forwarded to the physical terminal while the CPR is answered from the
+/// virtual terminal, so without holding the CPR the child would see it
+/// first and leave the colour reply unread in its tty buffer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_virtual_cpr_waits_for_forwarded_osc_reply() {
+    let (io, mut stdin_ours, mut stdout_ours) = test_io();
+    let (cmd_tx, cmd_rx) = mpsc::channel(10);
+    let (event_tx, _event_rx) = mpsc::channel(10);
+
+    let session = test_session();
+    let handle = tokio::spawn(async move { session.run(cmd_rx, event_tx, io).await });
+
+    // Raw mode so the reply bytes reach `dd` unmodified and unechoed. After
+    // both answers have had time to arrive, print whatever the first read
+    // returns as a compact octal dump followed by a marker.
+    cmd_tx
+        .send(spawn_cmd(
+            "stty raw -echo; printf '\\033]11;?\\033\\\\\\033[6n'; sleep 1; \
+             dd bs=512 count=1 2>/dev/null | od -An -c | tr -d ' \\n'; printf ' END\\n'; exit 0",
+        ))
+        .await
+        .unwrap();
+
+    // The OSC query must reach the physical terminal verbatim.
+    let collected = read_until(&mut stdout_ours, b"\x1b]11;?\x1b\\", Duration::from_secs(5));
+    assert!(
+        collected.windows(6).any(|w| w == b"\x1b]11;?"),
+        "OSC 11 query was not forwarded to stdout: {:?}",
+        String::from_utf8_lossy(&collected)
+    );
+
+    // Play the terminal: answer the colour query through stdin.
+    stdin_ours
+        .write_all(b"\x1b]11;rgb:1010/1010/1414\x1b\\")
+        .unwrap();
+    stdin_ours.flush().unwrap();
+
+    let collected = read_until(&mut stdout_ours, b" END", Duration::from_secs(10));
+    let text = render_all_lines(&collected, 80, 24).join("\n");
+    // `od -c` renders ESC as `033`; stop before the ST so its backslash
+    // escaping does not matter.
+    let osc_reply = "033]11;rgb:1010/1010/1414";
+    let osc_at = text.find(osc_reply).unwrap_or_else(|| {
+        panic!("child never received the OSC 11 reply; child saw: {text}")
+    });
+    let cpr_at = text.find("033[").expect("child saw no CSI at all");
+    assert!(
+        osc_at < cpr_at,
+        "cursor report reached the child before the OSC 11 reply; child saw: {text}"
+    );
+    let dump_end = text.find(" END").unwrap();
+    assert!(
+        text[..dump_end].ends_with('R'),
+        "cursor report should follow the OSC reply; child saw: {text}"
+    );
+
+    let _ = handle.await;
+}

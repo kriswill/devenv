@@ -252,6 +252,70 @@ pub enum SequenceEvent {
     VirtualTerminalQuery(VirtualTerminalQuery),
 }
 
+impl SequenceEvent {
+    /// Whether this event, once forwarded to the physical terminal, makes the
+    /// terminal send a reply back through stdin.
+    ///
+    /// Virtual replies (CPR, DSR, the mode 2048 report) are answered locally
+    /// and would otherwise reach the child before a reply the physical
+    /// terminal is still producing. Programs commonly send `OSC 11 ; ?`
+    /// followed by `CSI 6 n` and read until the CPR arrives, treating it as
+    /// the end of the OSC answer — termenv, and through it gh, glow and every
+    /// lipgloss v1 user, do exactly this. The session counts these forwarded
+    /// queries so it can hold virtual replies until the physical ones have
+    /// come back.
+    pub fn expects_physical_reply(&self) -> bool {
+        match self {
+            SequenceEvent::Osc(event) => osc_is_query(&event.raw_bytes),
+            SequenceEvent::ForwardCsi { raw_bytes } => forwarded_csi_expects_reply(raw_bytes),
+            SequenceEvent::ForwardDcs { raw_bytes } => forwarded_dcs_expects_reply(raw_bytes),
+            _ => false,
+        }
+    }
+}
+
+/// `OSC Ps ; ? ST` style colour and clipboard queries (`10;?`, `11;?`,
+/// `4;1;?`, `52;c;?`). The payload's last byte before the terminator is `?`.
+fn osc_is_query(raw_bytes: &[u8]) -> bool {
+    let Some(body) = raw_bytes.strip_prefix(b"\x1b]") else {
+        return false;
+    };
+    let payload = body
+        .strip_suffix(b"\x1b\\")
+        .or_else(|| body.strip_suffix(b"\x07"))
+        .unwrap_or(body);
+    payload.last() == Some(&b'?')
+}
+
+/// A CSI sequence that `classify_csi` forwards and that the terminal answers:
+/// DA1/DA2/DA3, DSR, XTVERSION, the kitty keyboard query, DECRQM and the
+/// XTWINOPS 16/21 reports. DECSCUSR and XTSHIFTESCAPE are forwarded but
+/// silent.
+fn forwarded_csi_expects_reply(raw_bytes: &[u8]) -> bool {
+    let Some(body) = raw_bytes.strip_prefix(b"\x1b[") else {
+        return false;
+    };
+    let Some((&final_byte, rest)) = body.split_last() else {
+        return false;
+    };
+    match final_byte {
+        b'c' | b'n' | b't' => true,
+        b'q' => rest.first() == Some(&b'>'),
+        b'u' => rest.first() == Some(&b'?'),
+        b'p' => rest.contains(&b'$'),
+        _ => false,
+    }
+}
+
+/// XTGETTCAP (`DCS + q … ST`) and DECRQSS (`DCS $ q … ST`) are the two DCS
+/// forms the terminal answers.
+fn forwarded_dcs_expects_reply(raw_bytes: &[u8]) -> bool {
+    matches!(
+        raw_bytes.strip_prefix(b"\x1bP"),
+        Some(body) if body.starts_with(b"+q") || body.starts_with(b"$q")
+    )
+}
+
 /// Maximum number of CSI parameters to accumulate.
 const MAX_CSI_PARAMS: usize = 16;
 /// Maximum number of CSI intermediate bytes.
@@ -1052,6 +1116,38 @@ mod tests {
     }
 
     // -- OSC tests --
+
+    #[test]
+    fn forwarded_queries_report_whether_the_terminal_answers() {
+        let mut scanner = EscapeScanner::new();
+        let cases: &[(&[u8], bool)] = &[
+            (b"\x1b]11;?\x1b\\", true),       // OSC 11 background query
+            (b"\x1b]10;?\x07", true),           // OSC 10 with BEL terminator
+            (b"\x1b]4;1;?\x1b\\", true),      // OSC 4 palette query
+            (b"\x1b]0;my title\x07", false),    // OSC 0 title set
+            (b"\x1b]8;;https://x\x1b\\", false), // OSC 8 hyperlink
+            (b"\x1b[c", true),                   // DA1
+            (b"\x1b[>c", true),                  // DA2
+            (b"\x1b[?6n", true),                 // DEC DSR
+            (b"\x1b[>q", true),                  // XTVERSION
+            (b"\x1b[?u", true),                  // kitty keyboard query
+            (b"\x1b[?2004$p", true),             // DECRQM
+            (b"\x1b[16t", true),                 // XTWINOPS cell size
+            (b"\x1b[2 q", false),                // DECSCUSR
+            (b"\x1b[>1s", false),                // XTSHIFTESCAPE
+            (b"\x1bP+q544e\x1b\\", true),     // XTGETTCAP
+            (b"\x1bP$qm\x1b\\", true),        // DECRQSS
+        ];
+        for (input, expected) in cases {
+            let events = scanner.scan(input);
+            assert_eq!(events.len(), 1, "one event for {input:?}");
+            assert_eq!(
+                events[0].expects_physical_reply(),
+                *expected,
+                "expects_physical_reply for {input:?}",
+            );
+        }
+    }
 
     #[test]
     fn osc_query_with_bel() {

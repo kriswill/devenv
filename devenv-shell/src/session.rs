@@ -827,8 +827,78 @@ fn is_ascii_decimal(bytes: &[u8]) -> bool {
     !bytes.is_empty() && bytes.iter().all(u8::is_ascii_digit)
 }
 
-fn flush_virtual_pty_replies(replies: &RefCell<VirtualPtyReplies>, pty: &Pty) -> io::Result<()> {
+/// Deliver captured virtual replies to the child unless a forwarded physical
+/// query is still unanswered, in which case they wait so the child receives
+/// replies in the order it sent the queries (see
+/// `SequenceEvent::expects_physical_reply`).
+fn flush_virtual_pty_replies(
+    replies: &RefCell<VirtualPtyReplies>,
+    pty: &Pty,
+    esc: &EscapeState,
+) -> io::Result<()> {
+    if esc.holding_virtual_replies() {
+        return Ok(());
+    }
     replies.borrow_mut().flush_to_pty(pty)
+}
+
+/// Count terminal replies in a chunk of stdin: OSC and DCS strings, and the
+/// CSI reports the physical terminal sends for the queries `classify_csi`
+/// forwards (DA1/2/3, DSR, DECRQM, kitty keyboard flags, XTWINOPS). Ordinary
+/// key and mouse input never takes these shapes. Kept deliberately narrow so
+/// a keystroke can never release a held virtual reply.
+fn count_physical_replies(data: &[u8]) -> usize {
+    let mut count = 0;
+    let mut i = 0;
+    while i < data.len() {
+        if data[i] != 0x1b || i + 1 >= data.len() {
+            i += 1;
+            continue;
+        }
+        match data[i + 1] {
+            // OSC … BEL | ST and DCS … ST
+            b']' | b'P' => {
+                let mut j = i + 2;
+                loop {
+                    match data.get(j) {
+                        None => return count,
+                        Some(0x07) if data[i + 1] == b']' => break,
+                        Some(0x1b) if data.get(j + 1) == Some(&b'\\') => {
+                            j += 1;
+                            break;
+                        }
+                        _ => j += 1,
+                    }
+                }
+                count += 1;
+                i = j + 1;
+            }
+            b'[' => {
+                let start = i + 2;
+                let mut j = start;
+                while j < data.len() && !(0x40..=0x7e).contains(&data[j]) {
+                    j += 1;
+                }
+                let Some(&final_byte) = data.get(j) else {
+                    return count;
+                };
+                let body = &data[start..j];
+                let private = body.first().is_some_and(|b| matches!(b, b'?' | b'>' | b'='));
+                let is_reply = match final_byte {
+                    b'c' | b'n' | b'R' | b'u' => private,
+                    b'y' => body.last() == Some(&b'$'),
+                    b't' => true,
+                    _ => false,
+                };
+                if is_reply {
+                    count += 1;
+                }
+                i = j + 1;
+            }
+            _ => i += 1,
+        }
+    }
+    count
 }
 
 /// Differential renderer that draws VT state to a bounded terminal region.
@@ -1536,6 +1606,8 @@ struct StdinEventContext<'a, 'vt, 'cb> {
     stdout: &'a mut Box<dyn Write + Send>,
     vt: &'a mut Terminal<'vt, 'cb>,
     renderer: &'a mut Renderer<'vt>,
+    esc: &'a mut EscapeState,
+    virtual_pty_replies: &'a RefCell<VirtualPtyReplies>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1993,6 +2065,19 @@ impl ShellSession {
             let event = if resize_pending {
                 resize_pending = false;
                 Some(Event::Resize)
+            } else if let Some(remaining) = esc.physical_reply_hold_remaining() {
+                // A virtual reply may be waiting behind a forwarded query.
+                // Bound the wait so a terminal that never answers cannot
+                // withhold the CPR from the child indefinitely.
+                match event_rx.recv_timeout(remaining) {
+                    Ok(event) => Some(event),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        esc.expire_physical_replies();
+                        flush_virtual_pty_replies(virtual_pty_replies, pty, &esc)?;
+                        continue;
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => None,
+                }
             } else if self.status_line.state().building {
                 match event_rx.recv_timeout(spinner_interval) {
                     Ok(event) => Some(event),
@@ -2046,6 +2131,8 @@ impl ShellSession {
                             stdout,
                             vt,
                             renderer,
+                            esc: &mut esc,
+                            virtual_pty_replies,
                         },
                     )?;
                 }
@@ -2075,7 +2162,7 @@ impl ShellSession {
                         let filtered = vt_input_filter.filter(&data, &mut vt_input);
                         renderer.feed(vt, filtered.as_bytes())?;
                     }
-                    flush_virtual_pty_replies(virtual_pty_replies, pty)?;
+                    flush_virtual_pty_replies(virtual_pty_replies, pty, &esc)?;
                     return_pty_read_buffer(pty_buffer_return_tx, data);
 
                     // Bound this render batch so sustained PTY output cannot
@@ -2098,7 +2185,7 @@ impl ShellSession {
                                     let filtered = vt_input_filter.filter(&more, &mut vt_input);
                                     renderer.feed(vt, filtered.as_bytes())?;
                                 }
-                                flush_virtual_pty_replies(virtual_pty_replies, pty)?;
+                                flush_virtual_pty_replies(virtual_pty_replies, pty, &esc)?;
                                 return_pty_read_buffer(pty_buffer_return_tx, more);
                             }
                             Event::PtyExit(exit_code) => {
@@ -2125,6 +2212,8 @@ impl ShellSession {
                                         stdout,
                                         vt,
                                         renderer,
+                                        esc: &mut esc,
+                                        virtual_pty_replies,
                                     },
                                 )?;
                             }
@@ -2329,6 +2418,8 @@ impl ShellSession {
             stdout,
             vt,
             renderer,
+            esc,
+            virtual_pty_replies,
         } = context;
         match classify_stdin(&self.config.keybindings, data, local_keybindings_enabled) {
             StdinDisposition::TogglePause => {
@@ -2376,6 +2467,12 @@ impl ShellSession {
             StdinDisposition::ForwardToPty if !data.is_empty() => {
                 pty.write_all(data)?;
                 pty.flush()?;
+                // Physical replies have now reached the child; any virtual
+                // reply held behind them may follow.
+                if esc.holding_virtual_replies() {
+                    esc.note_physical_replies(count_physical_replies(data));
+                    flush_virtual_pty_replies(virtual_pty_replies, pty, esc)?;
+                }
             }
             StdinDisposition::ForwardToPty => {}
         }
@@ -3792,6 +3889,63 @@ mod tests {
                 "incorrect ownership for reply {reply:?}",
             );
         }
+    }
+
+    #[test]
+    fn physical_reply_counter_matches_terminal_answers_only() {
+        let cases: &[(&[u8], usize)] = &[
+            (b"\x1b]11;rgb:1010/1010/1414\x1b\\", 1),   // OSC 11 answer, ST
+            (b"\x1b]10;rgb:c5c5/c9c9/c5c5\x07", 1),        // OSC 10 answer, BEL
+            (b"\x1b[?62;22c", 1),                          // DA1
+            (b"\x1b[>1;10;0c", 1),                         // DA2
+            (b"\x1b[?2004;2$y", 1),                        // DECRQM
+            (b"\x1b[?1u", 1),                              // kitty keyboard flags
+            (b"\x1b[6;16;8t", 1),                          // XTWINOPS cell size
+            (b"\x1bP>|libghostty\x1b\\", 1),            // XTVERSION (DCS)
+            (b"\x1b[?5;1R", 1),                            // DEC DSR cursor report
+            (b"\x1b]11;rgb:1/2/3\x1b\\\x1b[?62c", 2),  // two replies in one read
+            (b"abc", 0),
+            (b"\x1b[A\x1b[B", 0),                         // arrow keys
+            (b"\x1b[97u", 0),                              // kitty keyboard key event
+            (b"\x1b[<0;10;5M", 0),                         // SGR mouse
+            (b"\x1b[I\x1b[O", 0),                         // focus events
+            (b"\x1b[200~x\x1b[201~", 0),                  // bracketed paste
+            (b"\x1b[1;1R", 0),                             // plain CPR is virtual-owned
+            (b"\x1b]11;rgb:10", 0),                        // truncated: not yet a reply
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                count_physical_replies(input),
+                *expected,
+                "reply count for {input:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn virtual_replies_wait_for_outstanding_physical_ones() {
+        let mut esc = EscapeState::new();
+        assert!(!esc.holding_virtual_replies());
+        assert!(esc.physical_reply_hold_remaining().is_none());
+
+        esc.note_forwarded_query();
+        esc.note_forwarded_query();
+        assert!(esc.holding_virtual_replies());
+        assert!(esc.physical_reply_hold_remaining().is_some());
+
+        esc.note_physical_replies(1);
+        assert!(esc.holding_virtual_replies());
+        esc.note_physical_replies(1);
+        assert!(!esc.holding_virtual_replies());
+        assert!(esc.physical_reply_hold_remaining().is_none());
+
+        // More replies than queries never underflows.
+        esc.note_physical_replies(3);
+        assert!(!esc.holding_virtual_replies());
+
+        esc.note_forwarded_query();
+        esc.expire_physical_replies();
+        assert!(!esc.holding_virtual_replies());
     }
 
     #[test]
