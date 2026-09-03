@@ -15,6 +15,14 @@ use crossterm::{Command, queue, terminal};
 use portable_pty::PtySize;
 use std::collections::BTreeSet;
 use std::io::{self, Write};
+use std::time::{Duration, Instant};
+
+/// How long virtual replies wait behind a forwarded query whose answer never
+/// arrives. Terminals that ignore a query (an OSC 11 on a terminal without
+/// colour reporting, say) would otherwise pin the CPR forever; programs that
+/// use the CPR as their sentinel wait far longer than this for it (termenv
+/// allows five seconds), so a late CPR is harmless where a lost one is not.
+pub const PHYSICAL_REPLY_HOLD_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// Escape-sequence state tracked across PTY output processing.
 ///
@@ -48,6 +56,14 @@ pub struct EscapeState {
     /// The application released mode 2026 in the virtual terminal, but the
     /// physical reset is held until its deferred frame has been drawn.
     deferred_synchronized_output_reset: Vec<u8>,
+    /// Queries forwarded to the physical terminal whose replies have not yet
+    /// come back through stdin. While non-zero, virtual replies are held so
+    /// the child sees answers in the order it asked (see
+    /// `SequenceEvent::expects_physical_reply`).
+    pending_physical_replies: usize,
+    /// When the oldest outstanding physical query was forwarded; bounds the
+    /// hold with `PHYSICAL_REPLY_HOLD_TIMEOUT`.
+    pending_physical_since: Option<Instant>,
 }
 
 impl EscapeState {
@@ -63,7 +79,43 @@ impl EscapeState {
             in_band_resize: false,
             dec_mode_forward_buffer: Vec::new(),
             deferred_synchronized_output_reset: Vec::new(),
+            pending_physical_replies: 0,
+            pending_physical_since: None,
         }
+    }
+
+    /// A query that the physical terminal will answer was just forwarded.
+    pub fn note_forwarded_query(&mut self) {
+        if self.pending_physical_replies == 0 {
+            self.pending_physical_since = Some(Instant::now());
+        }
+        self.pending_physical_replies += 1;
+    }
+
+    /// `count` terminal replies were just forwarded from stdin to the child.
+    pub fn note_physical_replies(&mut self, count: usize) {
+        self.pending_physical_replies = self.pending_physical_replies.saturating_sub(count);
+        if self.pending_physical_replies == 0 {
+            self.pending_physical_since = None;
+        }
+    }
+
+    /// Whether virtual replies must wait for outstanding physical ones.
+    pub fn holding_virtual_replies(&self) -> bool {
+        self.pending_physical_replies > 0
+    }
+
+    /// Time left before an outstanding physical query is given up on, or
+    /// `None` when nothing is outstanding. `Some(ZERO)` means expired.
+    pub fn physical_reply_hold_remaining(&self) -> Option<Duration> {
+        self.pending_physical_since
+            .map(|since| PHYSICAL_REPLY_HOLD_TIMEOUT.saturating_sub(since.elapsed()))
+    }
+
+    /// Give up on every outstanding physical query.
+    pub fn expire_physical_replies(&mut self) {
+        self.pending_physical_replies = 0;
+        self.pending_physical_since = None;
     }
 
     /// Reset per-batch flags before processing a new `PtyOutput` batch.
@@ -198,6 +250,7 @@ pub fn process_escape_events(
     events_buf.clear();
     scanner.scan_into(data, events_buf);
     for event in events_buf.drain(..) {
+        let expects_physical_reply = event.expects_physical_reply();
         match event {
             SequenceEvent::DecMode(event) => {
                 // A program can release then immediately re-enter mode 2026
@@ -214,6 +267,9 @@ pub fn process_escape_events(
             }
             SequenceEvent::Osc(event) => {
                 stdout.write_all(&event.raw_bytes)?;
+                if expects_physical_reply {
+                    esc.note_forwarded_query();
+                }
             }
             SequenceEvent::EraseDisplay { .. } => {
                 esc.erase_display = true;
@@ -221,11 +277,11 @@ pub fn process_escape_events(
             SequenceEvent::ClearScrollback { .. } => {
                 esc.clear_scrollback = true;
             }
-            SequenceEvent::ForwardCsi { raw_bytes } => {
+            SequenceEvent::ForwardCsi { raw_bytes } | SequenceEvent::ForwardDcs { raw_bytes } => {
                 stdout.write_all(&raw_bytes)?;
-            }
-            SequenceEvent::ForwardDcs { raw_bytes } => {
-                stdout.write_all(&raw_bytes)?;
+                if expects_physical_reply {
+                    esc.note_forwarded_query();
+                }
             }
             SequenceEvent::ForwardScreenTitle { raw_bytes } => {
                 stdout.write_all(&raw_bytes)?;
