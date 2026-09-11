@@ -3,12 +3,14 @@
 //! This module provides the main `ShellSession` type that orchestrates
 //! PTY lifecycle, terminal I/O, and status line rendering.
 
+use crate::cell_size::{CellSize, CellSizeProbe};
 use crate::escape::EscapeScanner;
 use crate::escape_state::{
     EscapeState, cleanup_forwarded_modes as escape_state_cleanup,
     process_escape_events as escape_state_process,
 };
 use crate::keybindings::{ShellAction, ShellKeybindings};
+use crate::kitty_images::{self, ImageSync};
 use crate::protocol::{ShellCommand, ShellEvent};
 use crate::pty::{Pty, PtyError, get_terminal_size};
 use crate::status_line::{SPINNER_INTERVAL_MS, StatusLine};
@@ -795,7 +797,12 @@ impl VirtualPtyReplies {
 /// accepting a merely similar CSI response would make an unrelated physical
 /// query leak back to the child PTY.
 fn is_virtual_terminal_reply(data: &[u8]) -> bool {
-    data == b"\x1b[0n" || is_cpr_reply(data) || is_in_band_resize_mode_report(data)
+    data == b"\x1b[0n"
+        || is_cpr_reply(data)
+        || is_in_band_resize_mode_report(data)
+        // Kitty graphics commands are consumed by the VT (kitty_images.rs
+        // mirrors the placements), so its responses are the only ones.
+        || kitty_images::is_kitty_graphics_reply(data)
 }
 
 fn is_cpr_reply(data: &[u8]) -> bool {
@@ -883,7 +890,9 @@ fn count_physical_replies(data: &[u8]) -> usize {
                     return count;
                 };
                 let body = &data[start..j];
-                let private = body.first().is_some_and(|b| matches!(b, b'?' | b'>' | b'='));
+                let private = body
+                    .first()
+                    .is_some_and(|b| matches!(b, b'?' | b'>' | b'='));
                 let is_reply = match final_byte {
                     b'c' | b'n' | b'R' | b'u' => private,
                     b'y' => body.last() == Some(&b'$'),
@@ -976,6 +985,8 @@ struct Renderer<'a> {
     /// Viewport lines scrolled off since the last render; tells `render` that
     /// row content shifted so per-row dirty flags alone can't be trusted.
     pending_scroll: usize,
+    /// Kitty graphics placements mirrored onto the real terminal.
+    images: ImageSync,
 }
 
 /// Screen rows `[start, end)` that a primary-screen height shrink moved from
@@ -1011,6 +1022,7 @@ impl<'a> Renderer<'a> {
             flush_boundary,
             resize_exclusions: VecDeque::new(),
             pending_scroll: 0,
+            images: ImageSync::default(),
         })
     }
 
@@ -1472,10 +1484,35 @@ impl<'a> Renderer<'a> {
     fn present(&mut self, stdout: &mut impl Write, vt: &mut Terminal<'a, '_>) -> io::Result<()> {
         let primary = vt.active_screen().ok() == Some(Screen::Primary);
         if !primary || self.row_offset > 0 {
-            self.render(stdout, vt)
+            self.render(stdout, vt)?;
         } else {
-            self.render_with_scroll(stdout, vt)
+            self.render_with_scroll(stdout, vt)?;
         }
+        self.sync_images(stdout, vt)
+    }
+
+    /// Mirror the VT's kitty graphics placements after the rows they sit on
+    /// have been drawn. Placements are made at the cursor, so put it back.
+    fn sync_images(&mut self, stdout: &mut impl Write, vt: &Terminal<'_, '_>) -> io::Result<()> {
+        let visible_rows = self.visible_rows();
+        if self
+            .images
+            .sync(stdout, vt, self.row_offset, visible_rows)?
+        {
+            self.write_cursor(stdout, vt)?;
+        }
+        Ok(())
+    }
+
+    /// Drop every placement from the real terminal ahead of a full repaint
+    /// (resize); the next `present` places them again.
+    fn reset_image_placements(&mut self, stdout: &mut impl Write) -> io::Result<()> {
+        self.images.reset_placements(stdout)
+    }
+
+    /// Remove this session's images from the real terminal on exit.
+    fn cleanup_images(&mut self, stdout: &mut impl Write) -> io::Result<()> {
+        self.images.cleanup(stdout)
     }
 
     /// Terminal resize: the takeover phase ends (the terminal reflowed the
@@ -1595,6 +1632,7 @@ struct EventLoopContext<'a> {
     stdout: &'a mut Box<dyn Write + Send>,
     virtual_pty_replies: &'a RefCell<VirtualPtyReplies>,
     pty_buffer_return_tx: &'a std::sync::mpsc::SyncSender<Vec<u8>>,
+    cell_size_probe: CellSizeProbe,
 }
 
 /// The terminal-facing dependencies needed to dispatch one stdin event. This
@@ -1608,6 +1646,7 @@ struct StdinEventContext<'a, 'vt, 'cb> {
     renderer: &'a mut Renderer<'vt>,
     esc: &'a mut EscapeState,
     virtual_pty_replies: &'a RefCell<VirtualPtyReplies>,
+    cell_size_probe: &'a mut CellSizeProbe,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1657,6 +1696,10 @@ pub struct ShellSession {
     size: PtySize,
     status_line: StatusLine,
     shutdown_token: Option<CancellationToken>,
+    /// Real terminal cell size in pixels, once `CellSizeProbe` has learned
+    /// it. Gives the PTY its pixel dimensions and the VT its kitty graphics
+    /// grid geometry.
+    cell_size: Option<CellSize>,
 }
 
 impl ShellSession {
@@ -1672,20 +1715,59 @@ impl ShellSession {
             size,
             status_line,
             shutdown_token: None,
+            cell_size: None,
         }
     }
 
-    /// Get the PTY size, reserving 1 row for status line if enabled.
+    /// Get the PTY size, reserving 1 row for status line if enabled. Pixel
+    /// dimensions follow from the probed cell size (zero until known).
     fn pty_size(&self) -> PtySize {
-        if self.config.show_status_line {
-            PtySize {
-                rows: self.size.rows.saturating_sub(1).max(1),
-                cols: self.size.cols,
-                ..self.size
-            }
+        let rows = if self.config.show_status_line {
+            self.size.rows.saturating_sub(1).max(1)
         } else {
-            self.size
+            self.size.rows
+        };
+        let cols = self.size.cols;
+        let (cell_width, cell_height) = self.cell_px();
+        PtySize {
+            rows,
+            cols,
+            pixel_width: (cols as u32 * cell_width).min(u16::MAX as u32) as u16,
+            pixel_height: (rows as u32 * cell_height).min(u16::MAX as u32) as u16,
         }
+    }
+
+    /// Cell size for `Terminal::resize`, `(0, 0)` until probed.
+    fn cell_px(&self) -> (u32, u32) {
+        self.cell_size
+            .map(|c| (c.width as u32, c.height as u32))
+            .unwrap_or((0, 0))
+    }
+
+    /// The real terminal answered a cell-size probe: give the PTY its pixel
+    /// size (so `TIOCGWINSZ` works for `kitten icat` and friends) and the VT
+    /// its cell geometry (so kitty placements resolve to grid cells).
+    ///
+    /// Returns whether anything changed.
+    fn apply_cell_size(
+        &mut self,
+        cell_size: CellSize,
+        pty: &Pty,
+        vt: &mut Terminal<'_, '_>,
+    ) -> bool {
+        if self.cell_size == Some(cell_size) {
+            return false;
+        }
+        self.cell_size = Some(cell_size);
+        let pty_size = self.pty_size();
+        if let Err(e) = pty.resize(pty_size) {
+            tracing::debug!("session: failed to set PTY pixel size: {e}");
+        }
+        let (cell_width, cell_height) = self.cell_px();
+        if let Err(e) = vt.resize(pty_size.cols, pty_size.rows, cell_width, cell_height) {
+            tracing::warn!("session: failed to set VT cell size: {e}");
+        }
+        true
     }
 
     /// Create a new shell session with default configuration.
@@ -1975,6 +2057,10 @@ impl ShellSession {
             // This buffer therefore remains thread-local with the terminal;
             // it is drained into the child PTY immediately after each feed.
             let virtual_pty_replies = RefCell::new(VirtualPtyReplies::default());
+            // The kitty graphics PNG decoder is per thread in libghostty-rs
+            // and must be in place on this thread before the terminal is
+            // created (kitty_images.rs).
+            kitty_images::install_png_decoder();
             // Create the VT on this thread (Terminal is !Send)
             let mut vt = Terminal::new(pty_size.cols, pty_size.rows)?;
             vt.set_scrollback_max_bytes(Some(DEFAULT_MAX_SCROLLBACK))?;
@@ -1982,6 +2068,12 @@ impl ShellSession {
                 let virtual_pty_replies = &virtual_pty_replies;
                 move |_term, data| virtual_pty_replies.borrow_mut().capture(data)
             })?;
+            // Let the VT store kitty graphics images so the renderer can
+            // mirror their placements (kitty_images.rs); it also answers the
+            // child's image commands through the hook above.
+            if let Err(e) = kitty_images::enable(&mut vt) {
+                tracing::warn!("session: kitty graphics unavailable in VT: {e}");
+            }
 
             // Reset the VT after resize so any stale PTY output (the shell's
             // PROMPT_COMMAND after task execution, SIGWINCH redraw from the
@@ -2000,6 +2092,12 @@ impl ShellSession {
                     .draw(&mut stdout, self.size.cols, self.size.rows)?;
             }
             renderer.write_cursor(&mut stdout, &vt)?;
+            // Ask the real terminal for its cell size; the reply is taken off
+            // stdin by the event loop. Unlike the blocking cursor query above
+            // this is asynchronous, so it is safe with injected I/O too: a
+            // peer that never answers just lets the probe expire.
+            let mut cell_size_probe = CellSizeProbe::default();
+            cell_size_probe.query(&mut stdout)?;
             stdout.flush()?;
 
             self.event_loop(
@@ -2012,6 +2110,7 @@ impl ShellSession {
                     stdout: &mut stdout,
                     virtual_pty_replies: &virtual_pty_replies,
                     pty_buffer_return_tx: &pty_buffer_return_tx_for_loop,
+                    cell_size_probe,
                 },
             )
         });
@@ -2051,6 +2150,7 @@ impl ShellSession {
             stdout,
             virtual_pty_replies,
             pty_buffer_return_tx,
+            mut cell_size_probe,
         } = context;
         let spinner_interval = Duration::from_millis(SPINNER_INTERVAL_MS);
         let mut scanner = EscapeScanner::new();
@@ -2133,6 +2233,7 @@ impl ShellSession {
                             renderer,
                             esc: &mut esc,
                             virtual_pty_replies,
+                            cell_size_probe: &mut cell_size_probe,
                         },
                     )?;
                 }
@@ -2193,6 +2294,7 @@ impl ShellSession {
                                 let deferred_release = esc.has_deferred_synchronized_output_reset();
                                 self.clear_status_row(stdout, esc.in_alternate_screen)?;
                                 escape_state_cleanup(&esc, stdout)?;
+                                renderer.cleanup_images(stdout)?;
                                 if !synchronized && !deferred_release {
                                     begin_renderer_transaction(stdout, false)?;
                                 }
@@ -2214,6 +2316,7 @@ impl ShellSession {
                                         renderer,
                                         esc: &mut esc,
                                         virtual_pty_replies,
+                                        cell_size_probe: &mut cell_size_probe,
                                     },
                                 )?;
                             }
@@ -2222,6 +2325,7 @@ impl ShellSession {
                                 let deferred_release = esc.has_deferred_synchronized_output_reset();
                                 self.clear_status_row(stdout, esc.in_alternate_screen)?;
                                 escape_state_cleanup(&esc, stdout)?;
+                                renderer.cleanup_images(stdout)?;
                                 if !synchronized && !deferred_release {
                                     begin_renderer_transaction(stdout, false)?;
                                 }
@@ -2295,6 +2399,7 @@ impl ShellSession {
                     }
                     self.clear_status_row(stdout, esc.in_alternate_screen)?;
                     escape_state_cleanup(&esc, stdout)?;
+                    renderer.cleanup_images(stdout)?;
                     finish_renderer_transaction(
                         stdout,
                         &mut esc,
@@ -2359,7 +2464,10 @@ impl ShellSession {
                             cmd.write_ansi(&mut buf).unwrap();
                             let _ = pty.write_all(buf.as_bytes());
                         }
-                        if let Err(e) = vt.resize(pty_size.cols, pty_size.rows, 0, 0) {
+                        let (cell_width, cell_height) = self.cell_px();
+                        if let Err(e) =
+                            vt.resize(pty_size.cols, pty_size.rows, cell_width, cell_height)
+                        {
                             tracing::warn!("failed to resize terminal: {e}");
                         } else {
                             if let Some(start) = exclusion_start {
@@ -2372,6 +2480,11 @@ impl ShellSession {
                         // pending prefix; rows moved out of the old viewport
                         // are already present in native scrollback.
                         renderer.invalidate();
+                        // Placements move with the reflow; re-place them on
+                        // the next frame. A font zoom also changes the cell
+                        // size, so probe again.
+                        renderer.reset_image_placements(stdout)?;
+                        cell_size_probe.query(stdout)?;
                         if !synchronized_output_active(vt) {
                             renderer.render_with_scroll(stdout, vt)?;
                             if self.config.show_status_line && !esc.in_alternate_screen {
@@ -2400,6 +2513,7 @@ impl ShellSession {
         }
         self.clear_status_row(stdout, esc.in_alternate_screen)?;
         escape_state_cleanup(&esc, stdout)?;
+        renderer.cleanup_images(stdout)?;
         finish_renderer_transaction(stdout, &mut esc, synchronized || deferred_release)?;
         stdout.flush()?;
         Ok(None)
@@ -2420,7 +2534,29 @@ impl ShellSession {
             renderer,
             esc,
             virtual_pty_replies,
+            cell_size_probe,
         } = context;
+        // While a cell-size probe is outstanding its reply is ours, not the
+        // child's; everything else in the chunk continues below.
+        let mut without_probe_reply = Vec::new();
+        let data: &[u8] = if cell_size_probe.is_pending() {
+            if let Some(cell_size) = cell_size_probe.intercept(data, &mut without_probe_reply)
+                && self.apply_cell_size(cell_size, pty, vt)
+                && present_stdin_error_immediately(presentation, synchronized_output_active(vt))
+            {
+                // Kitty placements the VT already holds could not be sized
+                // without a cell size; present again so they get mirrored.
+                // (A batched event leaves that to the surrounding frame.)
+                queue!(stdout, terminal::BeginSynchronizedUpdate)?;
+                renderer.present(stdout, vt)?;
+                self.draw_status_and_cursor(stdout, vt, renderer)?;
+                queue!(stdout, terminal::EndSynchronizedUpdate)?;
+                stdout.flush()?;
+            }
+            &without_probe_reply
+        } else {
+            data
+        };
         match classify_stdin(&self.config.keybindings, data, local_keybindings_enabled) {
             StdinDisposition::TogglePause => {
                 if let Err(e) =
@@ -3872,6 +4008,8 @@ mod tests {
             (b"\x1b[?2048;2$y", true),
             (b"\x1b[?2048;3$y", true),
             (b"\x1b[?2048;4$y", true),
+            (b"\x1b_Gi=31;OK\x1b\\", true),
+            (b"\x1b_Gi=1;EINVAL:unknown\x1b\\", true),
             // Responses from physical-owned queries must never reach the
             // child through the virtual hook.
             (b"\x1b[?7;1$y", false),
@@ -3880,6 +4018,7 @@ mod tests {
             (b"\x1bP>|libghostty\x1b\\", false),
             (b"\x1b[48;23;80;0;0t", false),
             (b"\x1b[;80R", false),
+            (b"\x1b_Gi=31;OK", false),
         ];
 
         for (reply, expected) in cases {
@@ -3894,24 +4033,24 @@ mod tests {
     #[test]
     fn physical_reply_counter_matches_terminal_answers_only() {
         let cases: &[(&[u8], usize)] = &[
-            (b"\x1b]11;rgb:1010/1010/1414\x1b\\", 1),   // OSC 11 answer, ST
-            (b"\x1b]10;rgb:c5c5/c9c9/c5c5\x07", 1),        // OSC 10 answer, BEL
-            (b"\x1b[?62;22c", 1),                          // DA1
-            (b"\x1b[>1;10;0c", 1),                         // DA2
-            (b"\x1b[?2004;2$y", 1),                        // DECRQM
-            (b"\x1b[?1u", 1),                              // kitty keyboard flags
-            (b"\x1b[6;16;8t", 1),                          // XTWINOPS cell size
-            (b"\x1bP>|libghostty\x1b\\", 1),            // XTVERSION (DCS)
-            (b"\x1b[?5;1R", 1),                            // DEC DSR cursor report
-            (b"\x1b]11;rgb:1/2/3\x1b\\\x1b[?62c", 2),  // two replies in one read
+            (b"\x1b]11;rgb:1010/1010/1414\x1b\\", 1), // OSC 11 answer, ST
+            (b"\x1b]10;rgb:c5c5/c9c9/c5c5\x07", 1),   // OSC 10 answer, BEL
+            (b"\x1b[?62;22c", 1),                     // DA1
+            (b"\x1b[>1;10;0c", 1),                    // DA2
+            (b"\x1b[?2004;2$y", 1),                   // DECRQM
+            (b"\x1b[?1u", 1),                         // kitty keyboard flags
+            (b"\x1b[6;16;8t", 1),                     // XTWINOPS cell size
+            (b"\x1bP>|libghostty\x1b\\", 1),          // XTVERSION (DCS)
+            (b"\x1b[?5;1R", 1),                       // DEC DSR cursor report
+            (b"\x1b]11;rgb:1/2/3\x1b\\\x1b[?62c", 2), // two replies in one read
             (b"abc", 0),
-            (b"\x1b[A\x1b[B", 0),                         // arrow keys
-            (b"\x1b[97u", 0),                              // kitty keyboard key event
-            (b"\x1b[<0;10;5M", 0),                         // SGR mouse
-            (b"\x1b[I\x1b[O", 0),                         // focus events
-            (b"\x1b[200~x\x1b[201~", 0),                  // bracketed paste
-            (b"\x1b[1;1R", 0),                             // plain CPR is virtual-owned
-            (b"\x1b]11;rgb:10", 0),                        // truncated: not yet a reply
+            (b"\x1b[A\x1b[B", 0),        // arrow keys
+            (b"\x1b[97u", 0),            // kitty keyboard key event
+            (b"\x1b[<0;10;5M", 0),       // SGR mouse
+            (b"\x1b[I\x1b[O", 0),        // focus events
+            (b"\x1b[200~x\x1b[201~", 0), // bracketed paste
+            (b"\x1b[1;1R", 0),           // plain CPR is virtual-owned
+            (b"\x1b]11;rgb:10", 0),      // truncated: not yet a reply
         ];
         for (input, expected) in cases {
             assert_eq!(

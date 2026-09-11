@@ -18,6 +18,22 @@ impl Command for ReportTextAreaSize {
     }
 }
 
+/// XTWINOPS response: report text area size in pixels (CSI 4 ; height ; width t).
+///
+/// Answered from the PTY's dimensions and the real terminal's cell size (see
+/// `cell_size`), so `kitten icat` and friends measure the area the child
+/// actually owns rather than the whole window including the status line.
+pub struct ReportTextAreaPixelSize {
+    pub height_px: u16,
+    pub width_px: u16,
+}
+
+impl Command for ReportTextAreaPixelSize {
+    fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
+        write!(f, "\x1b[4;{};{}t", self.height_px, self.width_px)
+    }
+}
+
 /// Mode 2048 in-band resize notification (CSI 48 ; rows ; cols ; height_px ; width_px t).
 ///
 /// Sent through the PTY to notify programs of a terminal size change.

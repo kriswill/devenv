@@ -8,7 +8,7 @@
 use crate::escape::{CLEANUP_MODES, DecModeEvent, EscapeScanner, SequenceEvent};
 use crate::pty::Pty;
 use crate::terminal_commands::{
-    ReportTextAreaSize, ResetDecMode, ResetModifyOtherKeys, SetKeypadMode,
+    ReportTextAreaPixelSize, ReportTextAreaSize, ResetDecMode, ResetModifyOtherKeys, SetKeypadMode,
 };
 use crossterm::event::PopKeyboardEnhancementFlags;
 use crossterm::{Command, queue, terminal};
@@ -306,6 +306,26 @@ pub fn process_escape_events(
                 cmd.write_ansi(&mut buf).unwrap();
                 pty.write_all(buf.as_bytes())?;
                 pty.flush()?;
+            }
+            SequenceEvent::TextAreaPixelSizeQuery => {
+                if pty_size.pixel_width > 0 && pty_size.pixel_height > 0 {
+                    // The cell size has been probed: answer for the child's
+                    // own area, which excludes the status row.
+                    let cmd = ReportTextAreaPixelSize {
+                        height_px: pty_size.pixel_height,
+                        width_px: pty_size.pixel_width,
+                    };
+                    let mut buf = String::new();
+                    cmd.write_ansi(&mut buf).unwrap();
+                    pty.write_all(buf.as_bytes())?;
+                    pty.flush()?;
+                } else {
+                    // Not probed yet (or the terminal never answered): let
+                    // the real terminal report, as the mature passthrough
+                    // path did for every other XTWINOPS query.
+                    stdout.write_all(b"\x1b[14t")?;
+                    esc.note_forwarded_query();
+                }
             }
             // The raw bytes still reach libghostty-vt, whose narrowly
             // filtered `on_pty_write` effect responds from virtual state.

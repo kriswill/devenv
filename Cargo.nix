@@ -9399,6 +9399,10 @@ rec {
         libName = "devenv_shell";
         dependencies = [
           {
+            name = "base64";
+            packageId = "base64";
+          }
+          {
             name = "crossterm";
             packageId = "crossterm";
           }
@@ -9425,6 +9429,10 @@ rec {
             packageId = "libghostty-vt-sys";
             usesDefaultFeatures = false;
             features = [ "pkg-config" ];
+          }
+          {
+            name = "png";
+            packageId = "png";
           }
           {
             name = "portable-pty";
@@ -10824,6 +10832,22 @@ rec {
             packageId = "windows-sys 0.52.0";
             target = { target, features }: (target."windows" or false);
             features = [ "Win32_Foundation" "Win32_Storage_FileSystem" "Win32_System_IO" ];
+          }
+        ];
+
+      };
+      "fdeflate" = rec {
+        crateName = "fdeflate";
+        version = "0.3.7";
+        edition = "2021";
+        sha256 = "130ga18vyxbb5idbgi07njymdaavvk6j08yh1dfarm294ssm6s0y";
+        authors = [
+          "The image-rs Developers"
+        ];
+        dependencies = [
+          {
+            name = "simd-adler32";
+            packageId = "simd-adler32";
           }
         ];
 
@@ -19052,7 +19076,7 @@ rec {
           "simd" = [ "simd-adler32" ];
           "simd-adler32" = [ "dep:simd-adler32" ];
         };
-        resolvedDefaultFeatures = [ "simd" "simd-adler32" "with-alloc" ];
+        resolvedDefaultFeatures = [ "default" "simd" "simd-adler32" "with-alloc" ];
       };
       "mio" = rec {
         crateName = "mio";
@@ -22786,6 +22810,42 @@ rec {
           "Alex Crichton <alex@alexcrichton.com>"
         ];
 
+      };
+      "png" = rec {
+        crateName = "png";
+        version = "0.18.1";
+        edition = "2021";
+        sha256 = "0qca282xp8a6d7mikxrwji3f52mjn4vnqxz2v9iz5adj665rnxk0";
+        authors = [
+          "The image-rs Developers"
+        ];
+        dependencies = [
+          {
+            name = "bitflags";
+            packageId = "bitflags 2.13.0";
+          }
+          {
+            name = "crc32fast";
+            packageId = "crc32fast";
+          }
+          {
+            name = "fdeflate";
+            packageId = "fdeflate";
+          }
+          {
+            name = "flate2";
+            packageId = "flate2";
+          }
+          {
+            name = "miniz_oxide";
+            packageId = "miniz_oxide";
+            features = [ "simd" ];
+          }
+        ];
+        features = {
+          "unstable" = [ "crc32fast/nightly" ];
+          "zlib-rs" = [ "flate2/zlib-rs" ];
+        };
       };
       "polling" = rec {
         crateName = "polling";
@@ -29052,6 +29112,7 @@ rec {
         features = {
           "default" = [ "std" "const-generics" ];
         };
+        resolvedDefaultFeatures = [ "const-generics" "default" "std" ];
       };
       "simd_cesu8" = rec {
         crateName = "simd_cesu8";
