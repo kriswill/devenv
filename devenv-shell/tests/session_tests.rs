@@ -961,9 +961,9 @@ async fn test_virtual_cpr_waits_for_forwarded_osc_reply() {
     // `od -c` renders ESC as `033`; stop before the ST so its backslash
     // escaping does not matter.
     let osc_reply = "033]11;rgb:1010/1010/1414";
-    let osc_at = text.find(osc_reply).unwrap_or_else(|| {
-        panic!("child never received the OSC 11 reply; child saw: {text}")
-    });
+    let osc_at = text
+        .find(osc_reply)
+        .unwrap_or_else(|| panic!("child never received the OSC 11 reply; child saw: {text}"));
     let cpr_at = text.find("033[").expect("child saw no CSI at all");
     assert!(
         osc_at < cpr_at,
@@ -973,6 +973,171 @@ async fn test_virtual_cpr_waits_for_forwarded_osc_reply() {
     assert!(
         text[..dump_end].ends_with('R'),
         "cursor report should follow the OSC reply; child saw: {text}"
+    );
+
+    let _ = handle.await;
+}
+
+/// 1×1 PNG (red pixel), the same one libghostty's own docs use.
+const ONE_PIXEL_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
+
+/// Image ids on the real terminal live in `kitty_images`' private range.
+fn real_kitty_image_id(vt_id: u32) -> u32 {
+    (1 << 30) | vt_id
+}
+
+/// Answer the session's startup cell-size probe (`CSI 16 t`) so the PTY gets
+/// pixel dimensions and the VT a cell geometry. Returns whatever stdout bytes
+/// were read past the probe, which belong to the caller's next read.
+fn answer_cell_size_probe(
+    stdin_ours: &mut UnixStream,
+    stdout_ours: &mut UnixStream,
+    width: u16,
+    height: u16,
+) -> Vec<u8> {
+    let collected = read_until(stdout_ours, b"\x1b[16t", Duration::from_secs(5));
+    assert!(
+        collected.windows(5).any(|w| w == b"\x1b[16t"),
+        "session did not probe the cell size: {:?}",
+        String::from_utf8_lossy(&collected)
+    );
+    stdin_ours
+        .write_all(format!("\x1b[6;{height};{width}t").as_bytes())
+        .unwrap();
+    stdin_ours.flush().unwrap();
+    // Anything read past the probe belongs to the caller's next read.
+    let end = collected
+        .windows(5)
+        .position(|w| w == b"\x1b[16t")
+        .map(|at| at + 5)
+        .unwrap();
+    collected[end..].to_vec()
+}
+
+/// The kitty graphics capability query (`a=q`) is what `kitten icat` sends
+/// before anything else; the virtual terminal must answer it and the answer
+/// must reach the child (cachix/devenv#3130).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_kitty_graphics_query_is_answered_by_the_virtual_terminal() {
+    let (io, _stdin_ours, mut stdout_ours) = test_io();
+    let (cmd_tx, cmd_rx) = mpsc::channel(10);
+    let (event_tx, _event_rx) = mpsc::channel(10);
+
+    let session = test_session();
+    let handle = tokio::spawn(async move { session.run(cmd_rx, event_tx, io).await });
+
+    cmd_tx
+        .send(spawn_cmd(
+            "stty raw -echo; printf '\\033_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\\033\\\\'; sleep 1; \
+             dd bs=512 count=1 2>/dev/null | od -An -c | tr -d ' \\n'; printf ' END\\n'; exit 0",
+        ))
+        .await
+        .unwrap();
+
+    let collected = read_until(&mut stdout_ours, b" END", Duration::from_secs(10));
+    let text = render_all_lines(&collected, 80, 24).join("\n");
+    assert!(
+        text.contains("033_Gi=31;OK033"),
+        "child never received the kitty graphics reply; child saw: {text}"
+    );
+    // The child's query is consumed by the VT and must not leak to the
+    // physical terminal, which would answer it a second time.
+    assert!(
+        !collected.windows(9).any(|w| w == b"\x1b_Gi=31,s"),
+        "child's a=q query was forwarded to the physical terminal"
+    );
+
+    let _ = handle.await;
+}
+
+/// A transmit-and-display command stores the image in the VT; the renderer
+/// then mirrors it to the real terminal under a private id, placed at the
+/// cursor with an explicit grid size and `q=2`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_kitty_image_placement_is_mirrored_to_the_real_terminal() {
+    let (io, mut stdin_ours, mut stdout_ours) = test_io();
+    let (cmd_tx, cmd_rx) = mpsc::channel(10);
+    let (event_tx, _event_rx) = mpsc::channel(10);
+
+    let session = test_session();
+    let handle = tokio::spawn(async move { session.run(cmd_rx, event_tx, io).await });
+
+    cmd_tx
+        .send(spawn_cmd(&format!(
+            "sleep 1; printf '\\033_Ga=T,f=100,i=7,c=2,r=1,q=2;{ONE_PIXEL_PNG_B64}\\033\\\\'; \
+             printf '\\nDONE\\n'; sleep 0.5; exit 0"
+        )))
+        .await
+        .unwrap();
+
+    // The probe goes out once the session has taken over the terminal; the
+    // child's leading sleep leaves time for the answer to land first.
+    let mut collected = answer_cell_size_probe(&mut stdin_ours, &mut stdout_ours, 9, 20);
+
+    collected.extend(read_until(
+        &mut stdout_ours,
+        b"DONE",
+        Duration::from_secs(10),
+    ));
+    let text = String::from_utf8_lossy(&collected);
+    let real_id = real_kitty_image_id(7);
+    let transmit = format!("\x1b_Ga=t,t=d,q=2,i={real_id},f=32,s=1,v=1,m=0;");
+    assert!(
+        text.contains(&transmit),
+        "image was not transmitted to the physical terminal; stdout: {text:?}"
+    );
+    let place = format!("\x1b_Ga=p,q=2,C=1,i={real_id},p=1,c=2,r=1,");
+    assert!(
+        text.contains(&place),
+        "placement was not mirrored to the physical terminal; stdout: {text:?}"
+    );
+    // The child's own PNG payload never reaches the physical terminal.
+    assert!(
+        !text.contains("a=T,f=100"),
+        "child's transmit command leaked to the physical terminal"
+    );
+
+    // Session end removes the mirrored image again.
+    let collected = read_until(&mut stdout_ours, b"a=d,d=I", Duration::from_secs(10));
+    let text = String::from_utf8_lossy(&collected);
+    assert!(
+        text.contains(&format!("\x1b_Ga=d,d=I,q=2,i={real_id}\x1b\\")),
+        "mirrored image was not deleted on exit; stdout: {text:?}"
+    );
+
+    let _ = handle.await;
+}
+
+/// `CSI 14 t` is answered for the child's area from the probed cell size:
+/// 80 columns × 9 px and 24 rows × 20 px here (no status line).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_text_area_pixel_size_query_is_answered_from_probed_cell_size() {
+    let (io, mut stdin_ours, mut stdout_ours) = test_io();
+    let (cmd_tx, cmd_rx) = mpsc::channel(10);
+    let (event_tx, _event_rx) = mpsc::channel(10);
+
+    let session = test_session();
+    let handle = tokio::spawn(async move { session.run(cmd_rx, event_tx, io).await });
+
+    cmd_tx
+        .send(spawn_cmd(
+            "sleep 1; stty raw -echo; printf '\\033[14t'; sleep 1; \
+             dd bs=512 count=1 2>/dev/null | od -An -c | tr -d ' \\n'; printf ' END\\n'; exit 0",
+        ))
+        .await
+        .unwrap();
+
+    let _ = answer_cell_size_probe(&mut stdin_ours, &mut stdout_ours, 9, 20);
+
+    let collected = read_until(&mut stdout_ours, b" END", Duration::from_secs(10));
+    let text = render_all_lines(&collected, 80, 24).join("\n");
+    assert!(
+        text.contains("033[4;480;720t"),
+        "child did not get the PTY pixel size; child saw: {text}"
+    );
+    assert!(
+        !collected.windows(5).any(|w| w == b"\x1b[14t"),
+        "CSI 14 t was forwarded to the physical terminal despite a known cell size"
     );
 
     let _ = handle.await;

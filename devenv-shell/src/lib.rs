@@ -3,10 +3,12 @@
 //! This crate provides shell session management with hot-reload support,
 //! including PTY spawning, terminal handling, and status line rendering.
 
+pub mod cell_size;
 pub mod dialect;
 pub mod escape;
 pub mod escape_state;
 pub mod keybindings;
+pub mod kitty_images;
 mod protocol;
 mod pty;
 mod session;

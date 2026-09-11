@@ -19,6 +19,10 @@ iocraft.workspace = true
 
 # Terminal state tracking
 libghostty-vt.workspace = true
+# Kitty graphics passthrough (kitty_images.rs): PNG decoding for the virtual
+# terminal and base64 for re-transmitting pixels to the real terminal.
+png.workspace = true
+base64.workspace = true
 # Direct dep required to enable the `pkg-config` feature on libghostty-vt-sys.
 # Without it, libghostty-vt pulls libghostty-vt-sys with default features and
 # its build.rs invokes `zig build`, which fails when zig is not installed.

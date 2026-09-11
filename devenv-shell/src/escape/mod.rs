@@ -247,6 +247,10 @@ pub enum SequenceEvent {
     /// CSI 18 t — program is querying text area size in characters.
     /// The session responds with PTY dimensions (not real terminal size).
     TextAreaSizeQuery,
+    /// CSI 14 t — program is querying text area size in pixels. Answered
+    /// from PTY dimensions × the probed cell size once known (the child has
+    /// one row fewer than the real terminal); forwarded until then.
+    TextAreaPixelSizeQuery,
     /// Query handled by the virtual terminal's narrowly filtered reply hook.
     /// It must not be written to the physical terminal.
     VirtualTerminalQuery(VirtualTerminalQuery),
@@ -338,6 +342,9 @@ enum CsiClass {
     /// CSI 18 t — text area size query. Intercepted so we can respond
     /// with PTY dimensions instead of the real terminal size.
     TextAreaSizeQuery,
+    /// CSI 14 t — text area pixel size query. Intercepted for the same
+    /// reason; see `SequenceEvent::TextAreaPixelSizeQuery`.
+    TextAreaPixelSizeQuery,
     /// Query that must be answered from the virtual terminal state.
     VirtualTerminalQuery(VirtualTerminalQuery),
     /// AVT handles it, no forwarding needed.
@@ -386,6 +393,7 @@ fn classify_csi(
         // XTWINOPS queries (see FORWARDED_MODES doc comment for why
         // size-reporting queries are not forwarded to the real terminal).
         ([], b't') if first == 18 => CsiClass::TextAreaSizeQuery,
+        ([], b't') if first == 14 => CsiClass::TextAreaPixelSizeQuery,
         ([], b't') if matches!(first, 16 | 21) => CsiClass::Forward,
 
         // Erase — intercept for renderer coordination
@@ -902,6 +910,9 @@ impl EscapeScanner {
             CsiClass::TextAreaSizeQuery => {
                 events.push(SequenceEvent::TextAreaSizeQuery);
             }
+            CsiClass::TextAreaPixelSizeQuery => {
+                events.push(SequenceEvent::TextAreaPixelSizeQuery);
+            }
             CsiClass::VirtualTerminalQuery(query) => {
                 events.push(SequenceEvent::VirtualTerminalQuery(query));
             }
@@ -1121,10 +1132,10 @@ mod tests {
     fn forwarded_queries_report_whether_the_terminal_answers() {
         let mut scanner = EscapeScanner::new();
         let cases: &[(&[u8], bool)] = &[
-            (b"\x1b]11;?\x1b\\", true),       // OSC 11 background query
-            (b"\x1b]10;?\x07", true),           // OSC 10 with BEL terminator
-            (b"\x1b]4;1;?\x1b\\", true),      // OSC 4 palette query
-            (b"\x1b]0;my title\x07", false),    // OSC 0 title set
+            (b"\x1b]11;?\x1b\\", true),          // OSC 11 background query
+            (b"\x1b]10;?\x07", true),            // OSC 10 with BEL terminator
+            (b"\x1b]4;1;?\x1b\\", true),         // OSC 4 palette query
+            (b"\x1b]0;my title\x07", false),     // OSC 0 title set
             (b"\x1b]8;;https://x\x1b\\", false), // OSC 8 hyperlink
             (b"\x1b[c", true),                   // DA1
             (b"\x1b[>c", true),                  // DA2
@@ -1135,8 +1146,8 @@ mod tests {
             (b"\x1b[16t", true),                 // XTWINOPS cell size
             (b"\x1b[2 q", false),                // DECSCUSR
             (b"\x1b[>1s", false),                // XTSHIFTESCAPE
-            (b"\x1bP+q544e\x1b\\", true),     // XTGETTCAP
-            (b"\x1bP$qm\x1b\\", true),        // DECRQSS
+            (b"\x1bP+q544e\x1b\\", true),        // XTGETTCAP
+            (b"\x1bP$qm\x1b\\", true),           // DECRQSS
         ];
         for (input, expected) in cases {
             let events = scanner.scan(input);
@@ -1639,11 +1650,15 @@ mod tests {
     }
 
     #[test]
-    fn ignores_xtwinops_pixel_size() {
-        // CSI 14 t reports real terminal size; not forwarded (see FORWARDED_MODES).
+    fn intercepts_xtwinops_pixel_size() {
+        // CSI 14 t is intercepted so the session can answer with the PTY's
+        // pixel size (real cell size × the child's rows), never the whole
+        // window's.
         let mut scanner = EscapeScanner::new();
         let events = scanner.scan(b"\x1b[14t");
-        assert!(events.is_empty());
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], SequenceEvent::TextAreaPixelSizeQuery));
+        assert!(!events[0].expects_physical_reply());
     }
 
     #[test]
