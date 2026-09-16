@@ -129,11 +129,21 @@ let
       nativeBuildInputs = (attrs.nativeBuildInputs or [ ]) ++ [ pkg-config ];
       OPENSSL_NO_VENDOR = "1";
     }
-    # Unset, openssl-sys falls back to probing Homebrew on darwin (the nix
-    # sandbox is off there) and links its dylibs into the static binary.
-    // lib.optionalAttrs (stdenv.hostPlatform.isStatic && stdenv.hostPlatform.isDarwin) {
+    // {
+      # Pin the openssl location unconditionally so the build script never
+      # probes the host. On darwin, openssl-sys checks
+      # /opt/homebrew/opt/openssl@3 *before* pkg-config and, the nix sandbox
+      # being off there, finds it on any Mac with Homebrew's openssl (GitHub's
+      # macOS runners ship it). It then emits -L/opt/homebrew/... which the
+      # cc-wrapper drops as impure, so the final link fails with
+      # `ld: library not found for -lssl` — but only on those machines, making
+      # the derivation non-deterministic. With LIB_DIR + INCLUDE_DIR set the
+      # script takes the env verbatim and skips the probe on every platform.
       OPENSSL_LIB_DIR = "${lib.getLib openssl}/lib";
       OPENSSL_INCLUDE_DIR = "${lib.getDev openssl}/include";
+    }
+    # Static darwin: link the archives into the binary rather than the dylibs.
+    // lib.optionalAttrs (stdenv.hostPlatform.isStatic && stdenv.hostPlatform.isDarwin) {
       OPENSSL_STATIC = "1";
     };
 
@@ -237,6 +247,12 @@ in
 
   # openssl-sys needs openssl
   openssl-sys = opensslOverride;
+
+  # devenv-proxy links -lssl/-lcrypto (pingora's openssl backend) but, unlike
+  # `devenv`, gets no other override that would put openssl's lib dir on its
+  # link line; it relied solely on what openssl-sys's build script emitted.
+  # Give it the same override so the store path is always on the link line.
+  devenv-proxy = opensslOverride;
 
   # Pingora enables flate2's bundled zlib-ng backend.
   libz-ng-sys = attrs: {
