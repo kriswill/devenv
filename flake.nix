@@ -90,6 +90,13 @@
       packages = forAllSystems (
         system:
         let
+          # libstore has a `build/` source subdir, which collides with meson's
+          # default build dir. Meson >= 1.12 then treats build/*.cc as generated
+          # files and the unity build includes `build/build/build-log.cc`.
+          # nixpkgs' own nix-store sets the same override.
+          nixStoreMesonBuildDir = _: {
+            mesonBuildDir = "meson-build-dir";
+          };
           overlays = [
             inputs.rust-overlay.overlays.default
             # Exposes `nixComponents2` (the component scope) so we can rebuild the
@@ -116,16 +123,18 @@
                   let
                     staticComponents = prev.nixComponents2.overrideScope (
                       _finalScope: prevScope: {
-                        nix-store = prevScope.nix-store.override (
-                          {
-                            withAWS = false;
-                          }
-                          # nixpkgs gates this on isStatic alone, but the
-                          # sandbox shell is Linux-only and needs busybox.
-                          // prev.lib.optionalAttrs prev.stdenv.hostPlatform.isDarwin {
-                            embeddedSandboxShell = false;
-                          }
-                        );
+                        nix-store =
+                          (prevScope.nix-store.override (
+                            {
+                              withAWS = false;
+                            }
+                            # nixpkgs gates this on isStatic alone, but the
+                            # sandbox shell is Linux-only and needs busybox.
+                            // prev.lib.optionalAttrs prev.stdenv.hostPlatform.isDarwin {
+                              embeddedSandboxShell = false;
+                            }
+                          )).overrideAttrs
+                            nixStoreMesonBuildDir;
                       }
                     );
                   in
@@ -140,7 +149,7 @@
                           # aws-crt-cpp is a CMake dep with no .pc, so keeping S3
                           # needs the aws-c-* stack linked explicitly. Re-enable S3
                           # and link the aws libs once the startup win is confirmed.
-                          nix-store = prevScope.nix-store.override { withAWS = false; };
+                          nix-store = (prevScope.nix-store.override { withAWS = false; }).overrideAttrs nixStoreMesonBuildDir;
                         }
                       )).overrideAllMesonComponents
                         (
