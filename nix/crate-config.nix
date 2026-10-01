@@ -324,6 +324,12 @@ in
   # `-lghostty-vt` (the .so, which our static `.dev` output doesn't ship) →
   # "cannot find -lghostty-vt". With `link-static` it probes the
   # `libghostty-vt-static` pkg-config module and links `libghostty-vt.a`.
+  #
+  # On glibc, link the .so via `link-dynamic` (the crate now defaults to
+  # static). Zig 0.16 rebuilt on the gcc 16 stdenv emits a compiler_rt.o whose
+  # section symbols point at SHN_UNDEF, so linking libghostty-vt.a fails with
+  # an empty-named undefined symbol from `__memmove_chk`. nixpkgs' devenv does
+  # the same (NixOS/nixpkgs#567929).
   libghostty-vt-sys =
     attrs:
     {
@@ -332,6 +338,9 @@ in
     }
     // lib.optionalAttrs stdenv.hostPlatform.isStatic {
       features = (attrs.features or [ ]) ++ [ "link-static" ];
+    }
+    // lib.optionalAttrs (!stdenv.hostPlatform.isStatic) {
+      features = (attrs.features or [ ]) ++ [ "link-dynamic" ];
     };
 
   nix-bindings-util = nixLibsOverride;
