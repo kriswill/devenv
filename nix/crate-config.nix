@@ -254,6 +254,19 @@ in
   # Give it the same override so the store path is always on the link line.
   devenv-proxy = opensslOverride;
 
+  # nixpkgs' default override for aws-lc-sys >= 0.42 (2026-10) links the shared
+  # system aws-lc, whose lib/ ships its own libcrypto.so and libssl.so. That
+  # dir lands on devenv's final link line ahead of openssl's, so openssl-sys's
+  # -lcrypto resolves to aws-lc and the link fails (undefined
+  # ERR_get_error_all). Keep aws-lc vendored via the cmake builder, as
+  # nixpkgs did before.
+  aws-lc-sys = attrs: {
+    nativeBuildInputs = (attrs.nativeBuildInputs or [ ]) ++ [ cmake ];
+    env = (attrs.env or { }) // {
+      AWS_LC_SYS_CMAKE_BUILDER = 1;
+    };
+  };
+
   # Pingora enables flate2's bundled zlib-ng backend.
   libz-ng-sys = attrs: {
     nativeBuildInputs = (attrs.nativeBuildInputs or [ ]) ++ [ cmake ];
